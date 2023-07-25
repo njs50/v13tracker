@@ -4,7 +4,6 @@ import express from 'express';
 import strava from 'strava-v3';
 
 import * as fs from 'node:fs/promises';
-
 import * as path from 'node:path';
 
 const config = {
@@ -14,8 +13,7 @@ const config = {
     redirect_uri: 'http://localhost:3000/oauth',
     scope: 'read,read_all,profile:read_all,activity:read,activity:read_all',
   },
-  exportPath: path.join(process.env.PWD, '/data'),  
-  tokenFile: path.join(process.env.PWD, '/data', 'token.json')
+  exportPath: path.join(process.env.PWD, '/data'),
 };
 
 let _token
@@ -46,7 +44,7 @@ async function requestToken() {
     "redirect_uri"  : config.client.redirect_uri,
   }); 
 
-  const authorizationUri = strava.oauth.getRequestAccessURL({})
+  const authorizationUri = strava.oauth.getRequestAccessURL({scope: config.client.scope})
 
   console.log('the code uri is: ', authorizationUri)
 
@@ -72,33 +70,39 @@ async function requestToken() {
 }
 
 function writeToken() {
-  return fs.writeFile(config.tokenFile, JSON.stringify(_token, null, 2), { encoding: 'utf8' });
+  return writeFile('token.json', _token)   
+}
+
+function writeFile(fn, data) {
+  return fs.writeFile(path.join(config.exportPath, fn), JSON.stringify(data, null, 2), { encoding: 'utf8' });
+}
+
+async function readFile(fn) {
+  try {
+    const contents = await fs.readFile(path.join(config.exportPath, fn), { encoding: 'utf8' });
+    return JSON.parse(contents);
+  } catch (err) {
+    if (err.code == 'ENOENT') {
+      return null
+    } else {
+      console.error(err.message);
+    }
+  }  
 }
 
 async function getToken() {
 
+  _token = await readFile('token.json')
 
-  try {
-    const contents = await fs.readFile(config.tokenFile, { encoding: 'utf8' });
-    _token = JSON.parse(contents)
-    console.log('loaded existing access token')
-    // check if we need to refresh
-    if (_token.expires_at <= Math.floor((new Date).getTime() / 1000)) {
-      await refreshToken()
-    }
-
-
-  } catch (err) {
-    if (err.code == 'ENOENT') {
-      _token = await requestToken();
-    } else {
-      console.error(err.message);
-    }
+  if (_token == null) {
+    _token = await requestToken();
+  } else {
+    console.log('loaded existing access token');
   }
-
-
- 
-
+  // check if we need to refresh
+  if (_token.expires_at <= Math.floor((new Date).getTime() / 1000)) {
+    await refreshToken()
+  }
 
   // set the access token for the client to use
   strava.client(_token.access_token)  
@@ -139,21 +143,75 @@ async function createDataDir() {
 
 }
 
+
+async function getActivities() {
+
+  let params  = {
+    // before: getEpoch(new Date('2015-10-21')),
+    per_page: 30,
+    page: 1      
+  }
+
+  let results = await readFile('activities.json') || [];
+
+  // if this is the first run load 200 items at a time
+  if (results.length == 0) {
+    params.per_page = 200
+  }
+
+  let payload;
+
+  let loadedOldRecords = false
+
+  try {
+
+    do {
+
+      payload = await strava.athlete.listActivities(params)
+      
+      // remove any existing activites from the payload
+      for (const activity of results) {
+        const idx = payload.findIndex(newActivity => newActivity.id == activity.id)
+        if (idx > -1) {          
+          payload.splice(idx,1)
+        }
+      }
+
+      results = results.concat(payload)
+
+      params.page = params.page + 1
+      console.log('records loaded: ' + payload.length + ', results total: ' + results.length)
+
+    } while (payload.length == params.per_page)    
+
+    await writeFile('activities.json', results)
+
+    return results
+
+  } catch (err) {
+    console.error(err.message);
+  }
+
+
+}
+
+function getEpoch(date) {
+  return Math.ceil(date.getTime() / 1000)
+}
+
 async function run() {
 
   // create export path if it doesn't exist:
   await createDataDir()
 
+  // get us logged in
   const token = await getToken();
 
-  // await refreshToken()
-  
-  // console.log(config)
+  const activities = await getActivities()
 
-  
-  
+  // console.log(activities)
 
-
+  console.log(strava.rateLimiting.fractionReached());
 
 }
 
