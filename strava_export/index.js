@@ -3,8 +3,10 @@ import express from 'express';
 
 import strava from 'strava-v3';
 
+import * as fsNonPromise from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import * as https from 'node:https';
 
 const config = {
   client: {
@@ -13,7 +15,7 @@ const config = {
     redirect_uri: 'http://localhost:3000/oauth',
     scope: 'read,read_all,profile:read_all,activity:read,activity:read_all',
   },
-  exportPath: path.join(process.env.PWD, '/data'),
+  exportPath: path.join(process.env.PWD, '/data'),  
 };
 
 let _token
@@ -99,10 +101,9 @@ async function getToken() {
   } else {
     console.log('loaded existing access token');
   }
+
   // check if we need to refresh
-  if (_token.expires_at <= Math.floor((new Date).getTime() / 1000)) {
-    await refreshToken()
-  }
+  refreshToken()
 
   // set the access token for the client to use
   strava.client(_token.access_token)  
@@ -116,33 +117,45 @@ async function getToken() {
 
 async function refreshToken() {
 
-  const payload = await strava.oauth.refreshToken(_token.refresh_token)
-  
-  for (const key in payload) {
-    _token[key] = payload[key]
+  // refresh if token expires in the next minute
+  if (_token.expires_at - 60 <= Math.floor((new Date).getTime() / 1000)) {
+      
+    const payload = await strava.oauth.refreshToken(_token.refresh_token)
+    
+    for (const key in payload) {
+      _token[key] = payload[key]
+    }
+
+    strava.client(_token.access_token)
+
+    console.log('refreshed existing access token')
+
+    // write updated token to disk
+    await writeToken()  
+
   }
-
-  strava.client(_token.access_token)
-
-  console.log('refreshed existing access token')
-
-  // write updated token to disk
-  await writeToken()  
 
 }
 
-async function createDataDir() {
-
+async function createDir(dir) {
   try {
-    const createDir = await fs.mkdir(config.exportPath);
+    const createDir = await fs.mkdir(dir);
   } catch (err) {
     if (err.code != 'EEXIST') {
       console.error(err.message);
     }    
-  }
-
+  }  
 }
 
+
+async function createDataDir() {
+  createDir(config.exportPath);
+  createDir(path.join(config.exportPath, '/activities')); 
+}
+
+function loadActivities() {
+  return readFile('activities.json') || [];
+}
 
 async function getActivities() {
 
@@ -152,7 +165,7 @@ async function getActivities() {
     page: 1      
   }
 
-  let results = await readFile('activities.json') || [];
+  let results = await loadActivities();
 
   // if this is the first run load 200 items at a time
   if (results.length == 0) {
@@ -195,8 +208,135 @@ async function getActivities() {
 
 }
 
+function delay(time) {
+  return new Promise(resolve => setTimeout(resolve, time));
+} 
+
 function getEpoch(date) {
   return Math.ceil(date.getTime() / 1000)
+}
+
+
+async function getActivity(id) {
+
+  if (strava.rateLimiting.fractionReached() > 0.95) {
+    console.log(`waiting 15 minutes to prevent API throttling`);
+    await delay(15 * 60 * 1000); // 15 minute delay
+  }
+
+  const fn = `activities/${id}/activity.json`
+
+  let data = await readFile(fn)
+  
+  if (data !== null) {
+    console.log(`loaded activity ${id} from cache`);
+    return data
+  } else {
+    console.log(`loaded activity ${id} from strava`);
+    data = await strava.activities.get({id: id, include_all_efforts: true})
+    await writeFile(fn, data) 
+  }
+
+  return data
+
+}
+
+async function getActivitiesData() {
+
+  const activities = await getActivities()
+
+  for (let activity of activities) {    
+    // check if we need to refresh the access token
+    refreshToken()    
+    const data = await getActivity(activity.id);
+
+    if (data.total_photo_count > 0 && !data.trainer) {
+      await getActivityPhotos(data.id);
+    }   
+
+  }
+
+}
+
+async function getActivitiesPhotos() {
+
+  const activities = await getActivities()
+
+  for (let activity of activities) {
+    // check if we need to refresh the access token
+    refreshToken()    
+    if (activity.total_photo_count > 0 && activity.type == "Ride" && !activity.trainer) {
+      await getActivityPhotos(activity.id);
+    }
+  }
+
+}
+
+async function download(url, fn) {
+
+  let resolve;
+
+  const p = new Promise((_resolve) => {
+    resolve = _resolve;
+  });
+
+  https.get(url, (res) => {   
+    
+    const writeStream = fsNonPromise.createWriteStream(path.join(config.exportPath,fn));    
+    res.pipe(writeStream);
+  
+    writeStream.on("finish", () => {
+      writeStream.close();
+      console.log(`downloaded: ${url}`);
+      resolve()
+    });
+
+  });
+
+  return p;
+}
+
+async function getActivityPhotos(id) {
+
+  if (strava.rateLimiting.fractionReached() > 0.95) {
+    console.log(`waiting 15 minutes to prevent API throttling`);
+    await delay(15 * 60 * 1000); // 15 minute delay
+  }
+
+  const fn = `activities/${id}/photos.json`
+  const dir = path.join(config.exportPath,`activities/${id}`)
+
+  let data = await readFile(fn)
+  
+  if (data !== null) {
+    console.log(`loaded activity ${id} photos from cache`);
+  } else {
+    data = await strava.activities.listPhotos({id: id, size: 2048})
+    await writeFile(fn, data)
+    console.log(`loaded activity ${id} photos from strava`);
+  }
+
+  const files = await fs.readdir(dir);
+
+  // download image files
+  for (const photo of data) {    
+    const url = photo.urls['2048']
+    if (url && !url.match(/placeholder-photo/)) {
+      const ext = path.extname(url.replace(/\?.*$/,''))
+      const fn = `${photo.unique_id}${ext}`
+      const fp = `activities/${id}/${fn}`
+      if (files.indexOf(fn) == -1) {
+        await download(url, fp);
+        await delay(2000 + (Math.random() * 3000)) // 2-5 sec delay to help prevent us getting rate limited
+      }
+    } else {
+      console.error(`Missing photo in activity: ${id}`)
+    }
+  }
+
+
+  return data
+
 }
 
 async function run() {
@@ -206,12 +346,20 @@ async function run() {
 
   // get us logged in
   const token = await getToken();
+  
+  await getActivitiesData()
 
-  const activities = await getActivities()
+  // const activities = await getActivities()
+  // const photoActivity = activities.find(activity => activity.total_photo_count > 0 && activity.type == "Ride" && !activity.trainer)
 
-  // console.log(activities)
+  // console.log(await getActivityPhotos(9434568102)) //  
 
-  console.log(strava.rateLimiting.fractionReached());
+  // console.log(await getActivityPhotos(6764901674)) 
+
+  // await (getActivitiesPhotos())
+
+  console.log('done');
+
 
 }
 

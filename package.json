@@ -16,7 +16,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "open": "^9.1.0",
-    "strava-v3": "^2.2.0"
+    "strava-v3": "github:njs50/node-strava-v3#main"
   },
   "devDependencies": {
     "dotenv": "^16.3.1"
