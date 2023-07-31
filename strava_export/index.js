@@ -234,6 +234,7 @@ async function getActivity(id) {
   } else {
     console.log(`loaded activity ${id} from strava`);
     data = await strava.activities.get({id: id, include_all_efforts: true})
+    await createDir(path.join(config.exportPath, '/activities', id.toString())); 
     await writeFile(fn, data) 
   }
 
@@ -250,7 +251,7 @@ async function getActivitiesData() {
     refreshToken()    
     const data = await getActivity(activity.id);
 
-    if (data.total_photo_count > 0 && !data.trainer) {
+    if (data.total_photo_count > 0) {
       await getActivityPhotos(data.id);
     }   
 
@@ -265,7 +266,7 @@ async function getActivitiesPhotos() {
   for (let activity of activities) {
     // check if we need to refresh the access token
     refreshToken()    
-    if (activity.total_photo_count > 0 && activity.type == "Ride" && !activity.trainer) {
+    if (activity.total_photo_count > 0) {
       await getActivityPhotos(activity.id);
     }
   }
@@ -346,6 +347,9 @@ async function run() {
 
   // get us logged in
   const token = await getToken();
+
+  // check if token needs to be refreshed
+  await refreshToken()
   
   await getActivitiesData()
 
